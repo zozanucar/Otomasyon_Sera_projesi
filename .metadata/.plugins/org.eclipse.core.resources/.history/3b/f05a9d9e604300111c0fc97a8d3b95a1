@@ -1,0 +1,1101 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include "secure_telemetry.h"
+#include <math.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+#define TEMPERATURE_ALARM_DELTA_C 1.0f
+#define FLOW_RELAY_ON_THRESHOLD_LPM 3.0f
+#define FLOW_RELAY_OFF_THRESHOLD_LPM 2.5f
+#define FLOW_RELAY_ACTIVE_LEVEL GPIO_PIN_RESET
+#define FROST_RELAY_ACTIVE_LEVEL GPIO_PIN_RESET
+#define MOLD_RISK_TEMP_THRESHOLD_C 24.0f
+#define MOLD_RISK_HUMIDITY_THRESHOLD_PCT 80.0f
+#define MOLD_RISK_TEMP_RISE_DELTA_C 1.0f
+#define MOLD_RISK_HUMIDITY_RISE_DELTA_PCT 5.0f
+#define MOLD_RISK_TEMP_RESET_C 23.0f
+#define MOLD_RISK_HUMIDITY_RESET_PCT 75.0f
+#define FROST_NORMAL_DROP_TRIGGER_C 2.0f
+#define FROST_WARNING_TEMP_C 5.0f
+#define FROST_CRITICAL_TEMP_C 3.0f
+#define FROST_COOLING_RATE_TRIGGER_C_PER_MIN 0.5f
+#define FROST_PREDICTION_WINDOW_MIN 10.0f
+#define STEPPER_STEP_INTERVAL_MS 4U
+#define DHT22_SAMPLE_INTERVAL_MS 2000U
+#define FLOW_SAMPLE_INTERVAL_MS 1000U
+#define TELEMETRY_SEND_INTERVAL_MS 2000U
+#define ESP_RX_BUFFER_SIZE 256U
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+UART_HandleTypeDef huart2;
+
+/* USER CODE BEGIN PV */
+char at_command[] = "AT\r\n"; // ESP-01'e göndereceğimiz komut
+
+char rx_buffer[20] = {0}; // ESP-01'den gelecek cevabı tutacağımız yer
+volatile float g_temperature_c = 0.0f;
+volatile float g_humidity_pct = 0.0f;
+volatile float g_flow_l_min = 0.0f;
+volatile float g_flow_total_l = 0.0f;
+volatile float g_flow_frequency_hz = 0.0f;
+volatile uint32_t g_flow_pulse_count = 0U;
+volatile uint8_t g_dht_valid = 0U;
+
+static uint32_t flow_last_sample_tick = 0U;
+static uint32_t flow_last_sample_pulses = 0U;
+static uint32_t dht_last_sample_tick = 0U;
+static float temperature_reference_c = 0.0f;
+static float humidity_reference_pct = 0.0f;
+static uint8_t temperature_reference_valid = 0U;
+static uint8_t humidity_reference_valid = 0U;
+static uint32_t telemetry_last_send_tick = 0U;
+static uint8_t esp_tcp_connected = 0U;
+static char esp_rx_line[ESP_RX_BUFFER_SIZE] = {0};
+static uint8_t mold_risk_active = 0U;
+static uint8_t temperature_stepper_active = 0U;
+static uint8_t frost_risk_active = 0U;
+static uint8_t flow_relay_active = 0U;
+static uint8_t frost_relay_active = 0U;
+static uint8_t stepper_sequence_index = 0U;
+static uint32_t stepper_last_step_tick = 0U;
+static float frost_normal_temperature_c = 0.0f;
+static uint8_t frost_normal_valid = 0U;
+static float frost_last_temperature_c = 0.0f;
+static uint32_t frost_last_sample_tick = 0U;
+static uint8_t frost_last_sample_valid = 0U;
+static float frost_predicted_temperature_c = 0.0f;
+const char secret_key[] = "HackathZee_1283"; // Her iki tarafın da paylaştığı master secret
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_USART2_UART_Init(void);
+/* USER CODE BEGIN PFP */
+static void Sensors_Init(void);
+static void Sensors_Service(void);
+static void ServiceDelay(uint32_t delay_ms);
+static void DWT_Delay_Init(void);
+static void DelayUs(uint32_t delay_us);
+static void DHT22_SetPinOutput(void);
+static void DHT22_SetPinInput(void);
+static uint8_t DHT22_WaitForState(GPIO_PinState state, uint32_t timeout_us);
+static uint8_t DHT22_Read(float *temperature_c, float *humidity_pct);
+static void DHT22_Service(void);
+static void FlowSensor_Service(void);
+static void Stepper_Init(void);
+static void Stepper_Service(void);
+static void Stepper_Start(void);
+static void Stepper_Stop(void);
+static void ClimateRisk_Service(float temperature_c, float humidity_pct, uint32_t now);
+static void FrostRelay_Init(void);
+static void FrostRelay_Set(uint8_t enabled);
+static void Relay_Init(void);
+static void Relay_Service(void);
+static void Relay_Set(uint8_t enabled);
+static void Telemetry_Service(void);
+static void ESP_FlushRx(void);
+static uint8_t ESP_WaitForResponse(const char *expected_ok, const char *expected_alt_ok, const char *expected_fail, uint32_t timeout_ms);
+static uint8_t ESP_SendCommandAndWait(const char *command, const char *expected_ok, const char *expected_alt_ok, const char *expected_fail, uint32_t timeout_ms);
+static uint8_t ESP_InitModule(void);
+static uint8_t ESP_EnsureTcpConnected(void);
+static uint8_t ESP_SendPayload(const char *payload);
+static void BuildSensorPayload(char *buffer, size_t buffer_len);
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+static const uint8_t stepper_sequence[4][4] = {
+    {1U, 0U, 1U, 0U},
+    {0U, 1U, 1U, 0U},
+    {0U, 1U, 0U, 1U},
+    {1U, 0U, 0U, 1U}
+};
+static void Sensors_Init(void)
+{
+  DWT_Delay_Init();
+  DHT22_SetPinInput();
+  Stepper_Init();
+  Relay_Init();
+  FrostRelay_Init();
+  flow_last_sample_tick = HAL_GetTick();
+  dht_last_sample_tick = HAL_GetTick();
+  telemetry_last_send_tick = HAL_GetTick();
+}
+
+static void Sensors_Service(void)
+{
+  Stepper_Service();
+  FlowSensor_Service();
+  Relay_Service();
+  DHT22_Service();
+}
+
+static void Stepper_Init(void)
+{
+  Stepper_Stop();
+  stepper_last_step_tick = HAL_GetTick();
+}
+
+static void Stepper_Service(void)
+{
+  uint32_t now = HAL_GetTick();
+
+  if (temperature_stepper_active == 0U)
+  {
+    return;
+  }
+
+  if ((now - stepper_last_step_tick) < STEPPER_STEP_INTERVAL_MS)
+  {
+    return;
+  }
+
+  stepper_sequence_index = (uint8_t)((stepper_sequence_index + 1U) % 4U);
+  stepper_last_step_tick = now;
+
+  HAL_GPIO_WritePin(STEPPER_IN1_GPIO_Port, STEPPER_IN1_Pin, (GPIO_PinState)stepper_sequence[stepper_sequence_index][0]);
+  HAL_GPIO_WritePin(STEPPER_IN2_GPIO_Port, STEPPER_IN2_Pin, (GPIO_PinState)stepper_sequence[stepper_sequence_index][1]);
+  HAL_GPIO_WritePin(STEPPER_IN3_GPIO_Port, STEPPER_IN3_Pin, (GPIO_PinState)stepper_sequence[stepper_sequence_index][2]);
+  HAL_GPIO_WritePin(STEPPER_IN4_GPIO_Port, STEPPER_IN4_Pin, (GPIO_PinState)stepper_sequence[stepper_sequence_index][3]);
+}
+
+static void Stepper_Start(void)
+{
+  temperature_stepper_active = 1U;
+  stepper_sequence_index = 0U;
+  stepper_last_step_tick = HAL_GetTick();
+
+  HAL_GPIO_WritePin(STEPPER_IN1_GPIO_Port, STEPPER_IN1_Pin, (GPIO_PinState)stepper_sequence[0][0]);
+  HAL_GPIO_WritePin(STEPPER_IN2_GPIO_Port, STEPPER_IN2_Pin, (GPIO_PinState)stepper_sequence[0][1]);
+  HAL_GPIO_WritePin(STEPPER_IN3_GPIO_Port, STEPPER_IN3_Pin, (GPIO_PinState)stepper_sequence[0][2]);
+  HAL_GPIO_WritePin(STEPPER_IN4_GPIO_Port, STEPPER_IN4_Pin, (GPIO_PinState)stepper_sequence[0][3]);
+}
+
+static void Stepper_Stop(void)
+{
+  temperature_stepper_active = 0U;
+  HAL_GPIO_WritePin(GPIOB, STEPPER_IN1_Pin | STEPPER_IN2_Pin | STEPPER_IN3_Pin | STEPPER_IN4_Pin, GPIO_PIN_RESET);
+}
+
+static void Relay_Set(uint8_t enabled)
+{
+  GPIO_PinState pin_state = GPIO_PIN_RESET;
+
+  flow_relay_active = enabled;
+
+  if (enabled != 0U)
+  {
+    pin_state = FLOW_RELAY_ACTIVE_LEVEL;
+  }
+  else
+  {
+    pin_state = (FLOW_RELAY_ACTIVE_LEVEL == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET;
+  }
+
+  HAL_GPIO_WritePin(FLOW_RELAY_GPIO_Port, FLOW_RELAY_Pin, pin_state);
+}
+
+static void Relay_Init(void)
+{
+  Relay_Set(0U);
+}
+
+static void FrostRelay_Set(uint8_t enabled)
+{
+  GPIO_PinState pin_state = GPIO_PIN_RESET;
+
+  frost_relay_active = enabled;
+
+  if (enabled != 0U)
+  {
+    pin_state = FROST_RELAY_ACTIVE_LEVEL;
+  }
+  else
+  {
+    pin_state = (FROST_RELAY_ACTIVE_LEVEL == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET;
+  }
+
+  HAL_GPIO_WritePin(FROST_RELAY_GPIO_Port, FROST_RELAY_Pin, pin_state);
+}
+
+static void FrostRelay_Init(void)
+{
+  FrostRelay_Set(0U);
+}
+
+static void Relay_Service(void)
+{
+  if (flow_relay_active == 0U)
+  {
+    if (g_flow_l_min >= FLOW_RELAY_ON_THRESHOLD_LPM)
+    {
+      Relay_Set(1U);
+    }
+  }
+  else if (g_flow_l_min <= FLOW_RELAY_OFF_THRESHOLD_LPM)
+  {
+    Relay_Set(0U);
+  }
+}
+
+static void ClimateRisk_Service(float temperature_c, float humidity_pct, uint32_t now)
+{
+  float temperature_rise_c = 0.0f;
+  float humidity_rise_pct = 0.0f;
+  float cooling_rate_c_per_min = 0.0f;
+  float forecast_drop_c = 0.0f;
+
+  if (temperature_reference_valid == 0U)
+  {
+    temperature_reference_c = temperature_c;
+    temperature_reference_valid = 1U;
+  }
+
+  if (humidity_reference_valid == 0U)
+  {
+    humidity_reference_pct = humidity_pct;
+    humidity_reference_valid = 1U;
+  }
+
+  if (frost_normal_valid == 0U)
+  {
+    frost_normal_temperature_c = temperature_c;
+    frost_normal_valid = 1U;
+  }
+
+  if (frost_last_sample_valid != 0U)
+  {
+    uint32_t elapsed_ms = now - frost_last_sample_tick;
+
+    if (elapsed_ms >= 1000U)
+    {
+      float delta_temperature_c = frost_last_temperature_c - temperature_c;
+
+      if (delta_temperature_c > 0.0f)
+      {
+        cooling_rate_c_per_min = (delta_temperature_c * 60000.0f) / (float)elapsed_ms;
+      }
+    }
+  }
+
+  frost_last_temperature_c = temperature_c;
+  frost_last_sample_tick = now;
+  frost_last_sample_valid = 1U;
+
+  if (temperature_stepper_active == 0U)
+  {
+    if (temperature_c < temperature_reference_c)
+    {
+      temperature_reference_c = temperature_c;
+    }
+
+    if (humidity_pct < humidity_reference_pct)
+    {
+      humidity_reference_pct = humidity_pct;
+    }
+  }
+
+  temperature_rise_c = temperature_c - temperature_reference_c;
+  humidity_rise_pct = humidity_pct - humidity_reference_pct;
+
+  if ((temperature_stepper_active == 0U) &&
+      (temperature_c >= MOLD_RISK_TEMP_THRESHOLD_C) &&
+      (humidity_pct >= MOLD_RISK_HUMIDITY_THRESHOLD_PCT) &&
+      (temperature_rise_c >= MOLD_RISK_TEMP_RISE_DELTA_C) &&
+      (humidity_rise_pct >= MOLD_RISK_HUMIDITY_RISE_DELTA_PCT))
+  {
+    Stepper_Start();
+    mold_risk_active = 1U;
+  }
+  else if ((temperature_stepper_active != 0U) &&
+           ((temperature_c <= MOLD_RISK_TEMP_RESET_C) ||
+            (humidity_pct <= MOLD_RISK_HUMIDITY_RESET_PCT)))
+  {
+    Stepper_Stop();
+    mold_risk_active = 0U;
+    temperature_reference_c = temperature_c;
+    humidity_reference_pct = humidity_pct;
+  }
+
+  forecast_drop_c = logf(1.0f + (cooling_rate_c_per_min * FROST_PREDICTION_WINDOW_MIN));
+  frost_predicted_temperature_c = temperature_c - forecast_drop_c;
+
+  if ((temperature_c <= (frost_normal_temperature_c - FROST_NORMAL_DROP_TRIGGER_C)) &&
+      ((temperature_c <= FROST_CRITICAL_TEMP_C) ||
+       ((temperature_c <= FROST_WARNING_TEMP_C) &&
+        (cooling_rate_c_per_min >= FROST_COOLING_RATE_TRIGGER_C_PER_MIN) &&
+        (frost_predicted_temperature_c <= 0.0f))))
+  {
+    frost_risk_active = 1U;
+    FrostRelay_Set(1U);
+  }
+  else if ((temperature_c >= (frost_normal_temperature_c - 1.0f)) &&
+           (temperature_c > 4.0f))
+  {
+    frost_risk_active = 0U;
+    FrostRelay_Set(0U);
+  }
+}
+
+static void ESP_FlushRx(void)
+{
+  uint8_t byte = 0U;
+
+  while (HAL_UART_Receive(&huart2, &byte, 1U, 2U) == HAL_OK)
+  {
+  }
+}
+
+static uint8_t ESP_WaitForResponse(const char *expected_ok, const char *expected_alt_ok, const char *expected_fail, uint32_t timeout_ms)
+{
+  uint8_t byte = 0U;
+  uint32_t start_tick = HAL_GetTick();
+  size_t used = 0U;
+
+  esp_rx_line[0] = '\0';
+
+  while ((HAL_GetTick() - start_tick) < timeout_ms)
+  {
+    if (HAL_UART_Receive(&huart2, &byte, 1U, 1U) == HAL_OK)
+    {
+      if (used < (ESP_RX_BUFFER_SIZE - 1U))
+      {
+        esp_rx_line[used++] = (char)byte;
+      }
+      else
+      {
+        memmove(esp_rx_line, esp_rx_line + 1, ESP_RX_BUFFER_SIZE - 2U);
+        esp_rx_line[ESP_RX_BUFFER_SIZE - 2U] = (char)byte;
+        used = ESP_RX_BUFFER_SIZE - 1U;
+      }
+
+      esp_rx_line[used] = '\0';
+
+      if ((expected_ok != NULL) && (strstr(esp_rx_line, expected_ok) != NULL))
+      {
+        return 1U;
+      }
+
+      if ((expected_alt_ok != NULL) && (strstr(esp_rx_line, expected_alt_ok) != NULL))
+      {
+        return 1U;
+      }
+
+      if ((expected_fail != NULL) && (strstr(esp_rx_line, expected_fail) != NULL))
+      {
+        return 0U;
+      }
+    }
+
+    Sensors_Service();
+  }
+
+  return 0U;
+}
+
+static uint8_t ESP_SendCommandAndWait(const char *command, const char *expected_ok, const char *expected_alt_ok, const char *expected_fail, uint32_t timeout_ms)
+{
+  ESP_FlushRx();
+
+  if (HAL_UART_Transmit(&huart2, (uint8_t *)command, strlen(command), 1000U) != HAL_OK)
+  {
+    return 0U;
+  }
+
+  return ESP_WaitForResponse(expected_ok, expected_alt_ok, expected_fail, timeout_ms);
+}
+
+static uint8_t ESP_InitModule(void)
+{
+  uint8_t attempt = 0U;
+
+  for (attempt = 0U; attempt < 5U; attempt++)
+  {
+    if (ESP_SendCommandAndWait("AT\r\n", "OK", NULL, "ERROR", 1000U) != 0U)
+    {
+      break;
+    }
+
+    ServiceDelay(200U);
+  }
+
+  if (attempt == 5U)
+  {
+    return 0U;
+  }
+
+  if (ESP_SendCommandAndWait("ATE0\r\n", "OK", NULL, "ERROR", 1000U) == 0U)
+  {
+    return 0U;
+  }
+
+  if (ESP_SendCommandAndWait("AT+CWMODE=1\r\n", "OK", NULL, "ERROR", 1000U) == 0U)
+  {
+    return 0U;
+  }
+
+  if (ESP_SendCommandAndWait("AT+CWJAP=\"Sera_Agi\",\"12831283\"\r\n", "OK", "WIFI GOT IP", "FAIL", 15000U) == 0U)
+  {
+    return 0U;
+  }
+
+  if (ESP_SendCommandAndWait("AT+CIPMUX=0\r\n", "OK", NULL, "ERROR", 1000U) == 0U)
+  {
+    return 0U;
+  }
+
+  return 1U;
+}
+
+static uint8_t ESP_EnsureTcpConnected(void)
+{
+  if (esp_tcp_connected != 0U)
+  {
+    return 1U;
+  }
+
+  if (ESP_SendCommandAndWait("AT+CIPSTART=\"TCP\",\"192.168.4.1\",80\r\n", "OK", "ALREADY CONNECTED", "ERROR", 3000U) == 0U)
+  {
+    return 0U;
+  }
+
+  esp_tcp_connected = 1U;
+  return 1U;
+}
+
+static uint8_t ESP_SendPayload(const char *payload)
+{
+  char cmd_send[32];
+  size_t payload_len = strlen(payload);
+
+  if (ESP_EnsureTcpConnected() == 0U)
+  {
+    return 0U;
+  }
+
+  snprintf(cmd_send, sizeof(cmd_send), "AT+CIPSEND=%lu\r\n", (unsigned long)payload_len);
+
+  if (ESP_SendCommandAndWait(cmd_send, ">", NULL, "ERROR", 1500U) == 0U)
+  {
+    esp_tcp_connected = 0U;
+    return 0U;
+  }
+
+  ESP_FlushRx();
+
+  if (HAL_UART_Transmit(&huart2, (uint8_t *)payload, payload_len, 1000U) != HAL_OK)
+  {
+    esp_tcp_connected = 0U;
+    return 0U;
+  }
+
+  if (ESP_WaitForResponse("SEND OK", NULL, "ERROR", 2000U) == 0U)
+  {
+    esp_tcp_connected = 0U;
+    return 0U;
+  }
+
+  if (strstr(esp_rx_line, "CLOSED") != NULL)
+  {
+    esp_tcp_connected = 0U;
+  }
+
+  return 1U;
+}
+
+static void Telemetry_Service(void)
+{
+  char data[100];
+  char secure_packet[SECURE_TELEMETRY_MAX_PACKET_LEN];
+  uint32_t now = HAL_GetTick();
+
+  if (temperature_reference_valid == 0U)
+  {
+    return;
+  }
+
+  if ((now - telemetry_last_send_tick) < TELEMETRY_SEND_INTERVAL_MS)
+  {
+    return;
+  }
+
+  telemetry_last_send_tick = now;
+
+  BuildSensorPayload(data, sizeof(data));
+  if (SecureTelemetry_Encode((const uint8_t *)data, strlen(data), secret_key, secure_packet, sizeof(secure_packet)) == 0U)
+  {
+    return;
+  }
+
+  if (ESP_SendPayload(secure_packet) == 0U)
+  {
+    esp_tcp_connected = 0U;
+    (void)ESP_InitModule();
+    (void)ESP_EnsureTcpConnected();
+  }
+}
+
+static void ServiceDelay(uint32_t delay_ms)
+{
+  uint32_t start_tick = HAL_GetTick();
+
+  while ((HAL_GetTick() - start_tick) < delay_ms)
+  {
+    uint32_t remaining = delay_ms - (HAL_GetTick() - start_tick);
+    uint32_t chunk = (remaining > 10U) ? 10U : remaining;
+
+    Sensors_Service();
+
+    if (chunk > 0U)
+    {
+      HAL_Delay(chunk);
+    }
+  }
+}
+
+static void DWT_Delay_Init(void)
+{
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0U;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
+static void DelayUs(uint32_t delay_us)
+{
+  uint32_t start = DWT->CYCCNT;
+  uint32_t cycles = delay_us * (SystemCoreClock / 1000000U);
+
+  while ((DWT->CYCCNT - start) < cycles)
+  {
+  }
+}
+
+static void DHT22_SetPinOutput(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  GPIO_InitStruct.Pin = DHT22_DATA_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(DHT22_DATA_GPIO_Port, &GPIO_InitStruct);
+}
+
+static void DHT22_SetPinInput(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  GPIO_InitStruct.Pin = DHT22_DATA_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(DHT22_DATA_GPIO_Port, &GPIO_InitStruct);
+}
+
+static uint8_t DHT22_WaitForState(GPIO_PinState state, uint32_t timeout_us)
+{
+  uint32_t start = DWT->CYCCNT;
+  uint32_t timeout_cycles = timeout_us * (SystemCoreClock / 1000000U);
+
+  while ((DWT->CYCCNT - start) < timeout_cycles)
+  {
+    if (HAL_GPIO_ReadPin(DHT22_DATA_GPIO_Port, DHT22_DATA_Pin) == state)
+    {
+      return 1U;
+    }
+  }
+
+  return 0U;
+}
+
+static uint8_t DHT22_Read(float *temperature_c, float *humidity_pct)
+{
+  uint8_t data[5] = {0};
+  uint8_t i = 0U;
+  uint16_t raw_humidity = 0U;
+  uint16_t raw_temperature = 0U;
+
+  DHT22_SetPinOutput();
+  HAL_GPIO_WritePin(DHT22_DATA_GPIO_Port, DHT22_DATA_Pin, GPIO_PIN_RESET);
+  DelayUs(1200U);
+
+  DHT22_SetPinInput();
+  DelayUs(30U);
+
+  if (DHT22_WaitForState(GPIO_PIN_RESET, 100U) == 0U)
+  {
+    return 0U;
+  }
+
+  if (DHT22_WaitForState(GPIO_PIN_SET, 100U) == 0U)
+  {
+    return 0U;
+  }
+
+  if (DHT22_WaitForState(GPIO_PIN_RESET, 100U) == 0U)
+  {
+    return 0U;
+  }
+
+  for (i = 0U; i < 40U; i++)
+  {
+    if (DHT22_WaitForState(GPIO_PIN_SET, 100U) == 0U)
+    {
+      return 0U;
+    }
+
+    DelayUs(40U);
+    data[i / 8U] <<= 1U;
+
+    if (HAL_GPIO_ReadPin(DHT22_DATA_GPIO_Port, DHT22_DATA_Pin) == GPIO_PIN_SET)
+    {
+      data[i / 8U] |= 1U;
+    }
+
+    if ((i < 39U) && (DHT22_WaitForState(GPIO_PIN_RESET, 100U) == 0U))
+    {
+      return 0U;
+    }
+  }
+
+  if (((uint8_t)(data[0] + data[1] + data[2] + data[3])) != data[4])
+  {
+    return 0U;
+  }
+
+  raw_humidity = ((uint16_t)data[0] << 8) | data[1];
+  raw_temperature = ((uint16_t)data[2] << 8) | data[3];
+
+  *humidity_pct = raw_humidity / 10.0f;
+
+  if ((raw_temperature & 0x8000U) != 0U)
+  {
+    raw_temperature &= 0x7FFFU;
+    *temperature_c = -(raw_temperature / 10.0f);
+  }
+  else
+  {
+    *temperature_c = raw_temperature / 10.0f;
+  }
+
+  return 1U;
+}
+
+static void DHT22_Service(void)
+{
+  float temperature_c = 0.0f;
+  float humidity_pct = 0.0f;
+  uint32_t now = HAL_GetTick();
+
+  if ((now - dht_last_sample_tick) < DHT22_SAMPLE_INTERVAL_MS)
+  {
+    return;
+  }
+
+  dht_last_sample_tick = now;
+
+  if (DHT22_Read(&temperature_c, &humidity_pct) != 0U)
+  {
+    g_temperature_c = temperature_c;
+    g_humidity_pct = humidity_pct;
+    g_dht_valid = 1U;
+    ClimateRisk_Service(temperature_c, humidity_pct, now);
+  }
+  else
+  {
+    g_dht_valid = 0U;
+  }
+}
+
+static void FlowSensor_Service(void)
+{
+  uint32_t now = HAL_GetTick();
+  uint32_t elapsed_ms = now - flow_last_sample_tick;
+  uint32_t pulse_delta = 0U;
+  float frequency_hz = 0.0f;
+  float flow_l_min = 0.0f;
+
+  if (elapsed_ms < FLOW_SAMPLE_INTERVAL_MS)
+  {
+    return;
+  }
+
+  pulse_delta = g_flow_pulse_count - flow_last_sample_pulses;
+  frequency_hz = (pulse_delta * 1000.0f) / elapsed_ms;
+
+  if (pulse_delta == 0U)
+  {
+    flow_l_min = 0.0f;
+  }
+  else
+  {
+    flow_l_min = (frequency_hz + 3.0f) / 23.0f;
+  }
+
+  g_flow_frequency_hz = frequency_hz;
+  g_flow_l_min = flow_l_min;
+  g_flow_total_l = g_flow_pulse_count / 1380.0f;
+
+  flow_last_sample_tick = now;
+  flow_last_sample_pulses = g_flow_pulse_count;
+}
+
+static void BuildSensorPayload(char *buffer, size_t buffer_len)
+{
+  int32_t temperature_x10 = (int32_t)(g_temperature_c * 10.0f);
+  uint32_t temperature_fraction = (uint32_t)abs((int)(temperature_x10 % 10));
+  uint32_t humidity_x10 = (uint32_t)(g_humidity_pct * 10.0f);
+  uint32_t flow_x100 = (uint32_t)(g_flow_l_min * 100.0f);
+
+  snprintf(
+      buffer,
+      buffer_len,
+      "Sicaklik: %ld.%luC, Nem: %lu.%lu%%, Debi: %lu.%02luL/dk, Fan: %u, Don: %u\r\n",
+      (long)(temperature_x10 / 10),
+      (unsigned long)temperature_fraction,
+      (unsigned long)(humidity_x10 / 10U),
+      (unsigned long)(humidity_x10 % 10U),
+      (unsigned long)(flow_x100 / 100U),
+      (unsigned long)(flow_x100 % 100U),
+      (unsigned int)mold_risk_active,
+      (unsigned int)frost_risk_active);
+}
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_USART2_UART_Init();
+  /* USER CODE BEGIN 2 */
+  Sensors_Init();
+  ServiceDelay(500U);
+  (void)ESP_InitModule();
+  (void)ESP_EnsureTcpConnected();
+  /*
+  // 0. AŞAMA: ESP'Yİ FABRİKA AYARLARINA DÖNDÜR VE RESETLE
+    char cmd_rst[] = "AT+RESTORE\r\n";
+    HAL_UART_Transmit(&huart2, (uint8_t*)cmd_rst, strlen(cmd_rst), 1000);
+    ServiceDelay(3000); // Fabrika ayarlarına dönüp yeniden başlaması için 3 saniye ver
+
+    // 1. AŞAMA: Gönderici ESP'yi "Müşteri" (Station) moduna al
+    char cmd_mode[] = "AT+CWMODE=1\r\n";
+    HAL_UART_Transmit(&huart2, (uint8_t*)cmd_mode, strlen(cmd_mode), 1000);
+    ServiceDelay(1000);
+
+    // 2. AŞAMA: Wİ-Fİ AĞINA BAĞLANMA
+    char cmd_wifi[] = "AT+CWJAP=\"Sera_Agi\",\"12831283\"\r\n";
+    HAL_UART_Transmit(&huart2, (uint8_t*)cmd_wifi, strlen(cmd_wifi), 1000);
+    ServiceDelay(8000); // Ağa katılması için 8 saniye bekle
+  */
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    Sensors_Service();
+    Telemetry_Service();
+    /*
+	  Sensors_Service();
+	  	  // 1. ADIM: Doğru IP adresine (192.168.4.1) bağlan
+	  	  char cmd_connect[] = "AT+CIPSTART=\"TCP\",\"192.168.4.1\",80\r\n";
+	  	  HAL_UART_Transmit(&huart2, (uint8_t*)cmd_connect, strlen(cmd_connect), 1000);
+	  	  ServiceDelay(2000);
+
+	  	  // 2. ADIM: Gönderilecek Ham Veriyi Hazırla (Plaintext)
+	  	  char data[100];
+	  	  BuildSensorPayload(data, sizeof(data));
+
+	  	  // --- SİBER GÜVENLİK ADIMI EKLENİYOR ---
+	  	  char encrypted_data[200]; // HEX formatı boyutu 2 katına çıkarır, o yüzden 200 yaptık.
+	  	  Encrypt_To_Hex(data, encrypted_data, secret_key); // Şifrele!
+	  	  int veri_uzunlugu = strlen(encrypted_data); // Artık uzunluk şifreli metnin uzunluğu
+	  	  // --------------------------------------
+
+	  	  // 3. ADIM: Veri boyutunu ESP'ye söyle
+	  	  char cmd_send[30];
+	  	  sprintf(cmd_send, "AT+CIPSEND=%d\r\n", veri_uzunlugu);
+	  	  HAL_UART_Transmit(&huart2, (uint8_t*)cmd_send, strlen(cmd_send), 1000);
+	  	  ServiceDelay(500);
+
+	  	  // 4. ADIM: Asıl ŞİFRELİ veriyi yolla
+	  	  HAL_UART_Transmit(&huart2, (uint8_t*)encrypted_data, veri_uzunlugu, 1000);
+	  	  ServiceDelay(500);
+
+	  	  // 5. ADIM: Bağlantıyı kapat ki şişmesin
+	  	  char cmd_close[] = "AT+CIPCLOSE\r\n";
+	  	  HAL_UART_Transmit(&huart2, (uint8_t*)cmd_close, strlen(cmd_close), 1000);
+
+	  	  // 6. ADIM: 3 saniye dinlen ve tekrarla
+	  	  ServiceDelay(3000);
+    */
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 4;
+  RCC_OscInitStruct.PLL.PLLN = 168;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 4;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(FLOW_RELAY_GPIO_Port, FLOW_RELAY_Pin,
+                    (FLOW_RELAY_ACTIVE_LEVEL == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(FROST_RELAY_GPIO_Port, FROST_RELAY_Pin,
+                    (FROST_RELAY_ACTIVE_LEVEL == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6|GPIO_PIN_7|GPIO_PIN_8|GPIO_PIN_9, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : PA0 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PB0 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : FLOW_RELAY_Pin */
+  GPIO_InitStruct.Pin = FLOW_RELAY_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(FLOW_RELAY_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : FROST_RELAY_Pin */
+  GPIO_InitStruct.Pin = FROST_RELAY_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(FROST_RELAY_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PB6 PB7 PB8 PB9 */
+  GPIO_InitStruct.Pin = GPIO_PIN_6|GPIO_PIN_7|GPIO_PIN_8|GPIO_PIN_9;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI0_IRQn);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+  GPIO_InitStruct.Pin = STEPPER_IN1_Pin | STEPPER_IN2_Pin | STEPPER_IN3_Pin | STEPPER_IN4_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  HAL_GPIO_WritePin(GPIOB, STEPPER_IN1_Pin | STEPPER_IN2_Pin | STEPPER_IN3_Pin | STEPPER_IN4_Pin, GPIO_PIN_RESET);
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if (GPIO_Pin == FLOW_SENSOR_Pin)
+  {
+    g_flow_pulse_count++;
+  }
+}
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+
+#ifdef  USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */

@@ -1,0 +1,459 @@
+import queue
+import re
+import threading
+import time
+import tkinter as tk
+from dataclasses import dataclass
+from tkinter import messagebox, ttk
+
+import serial
+from serial.tools import list_ports
+
+
+DEFAULT_PORT = "COM8"
+DEFAULT_BAUDRATE = 115200
+DEFAULT_KEY = "HackathZee_1283"
+DEFAULT_AP_SSID = "Sera_Agi"
+DEFAULT_AP_PASSWORD = "12831283"
+DEFAULT_WIFI_MODE = "3"
+DEFAULT_AP_CHANNEL = "1"
+DEFAULT_AP_ENCRYPTION = "3"
+
+HEX_BLOCK_RE = re.compile(r"(?<![0-9A-Fa-f])([0-9A-Fa-f]{16,})(?![0-9A-Fa-f])")
+IPD_RE = re.compile(r"\+IPD,(?:\d+,)?\d+:([0-9A-Fa-f]+)")
+PAYLOAD_RE = re.compile(
+    r"Sicaklik:\s*([-+]?\d+(?:\.\d+)?)C,\s*Nem:\s*(\d+(?:\.\d+)?)%,\s*Debi:\s*(\d+(?:\.\d+)?)L/dk",
+    re.IGNORECASE,
+)
+
+
+@dataclass
+class SensorData:
+    temperature_c: str = "--"
+    humidity_pct: str = "--"
+    flow_l_min: str = "--"
+    plaintext: str = ""
+    encrypted_hex: str = ""
+    updated_at: str = "--"
+
+
+def decrypt_hex_payload(hex_payload: str, key: str) -> str:
+    encrypted_bytes = bytes.fromhex(hex_payload)
+    key_bytes = key.encode("utf-8")
+    decrypted = bytearray()
+
+    for index, value in enumerate(encrypted_bytes):
+        decrypted.append(value ^ key_bytes[index % len(key_bytes)])
+
+    return decrypted.decode("utf-8", errors="replace")
+
+
+def parse_sensor_payload(payload: str) -> SensorData | None:
+    match = PAYLOAD_RE.search(payload.strip())
+    if not match:
+        return None
+
+    return SensorData(
+        temperature_c=match.group(1),
+        humidity_pct=match.group(2),
+        flow_l_min=match.group(3),
+        plaintext=payload.strip(),
+        updated_at=time.strftime("%H:%M:%S"),
+    )
+
+
+class SerialReader(threading.Thread):
+    def __init__(self, port: str, baudrate: int, output_queue: queue.Queue):
+        super().__init__(daemon=True)
+        self.port = port
+        self.baudrate = baudrate
+        self.output_queue = output_queue
+        self.stop_event = threading.Event()
+        self.serial_conn = None
+        self.text_buffer = ""
+        self.recent_blocks: dict[str, float] = {}
+        self.write_lock = threading.Lock()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.serial_conn and self.serial_conn.is_open:
+            self.serial_conn.close()
+
+    def send_command(self, command: str) -> None:
+        if not self.serial_conn or not self.serial_conn.is_open:
+            raise RuntimeError("Seri port acik degil")
+
+        prepared = command if command.endswith("\r\n") else f"{command}\r\n"
+        with self.write_lock:
+            self.serial_conn.write(prepared.encode("utf-8"))
+            self.serial_conn.flush()
+
+        self.output_queue.put(("sent_command", prepared))
+
+    def run(self) -> None:
+        try:
+            self.serial_conn = serial.Serial(self.port, self.baudrate, timeout=0.2)
+            self.output_queue.put(("status", f"{self.port} baglandi"))
+        except Exception as exc:
+            self.output_queue.put(("error", f"Seri port acilamadi: {exc}"))
+            return
+
+        while not self.stop_event.is_set():
+            try:
+                incoming = self.serial_conn.read(self.serial_conn.in_waiting or 1)
+            except Exception as exc:
+                self.output_queue.put(("error", f"Seri okuma hatasi: {exc}"))
+                break
+
+            if not incoming:
+                continue
+
+            text = incoming.decode("utf-8", errors="ignore")
+            self.output_queue.put(("raw_text", text))
+            self.text_buffer += text
+            self._process_buffer()
+
+        self.output_queue.put(("status", "Seri okuma durdu"))
+
+    def _process_buffer(self) -> None:
+        if len(self.text_buffer) > 8000:
+            self.text_buffer = self.text_buffer[-4000:]
+
+        for match in IPD_RE.finditer(self.text_buffer):
+            self._emit_hex_candidate(match.group(1))
+
+        for match in HEX_BLOCK_RE.finditer(self.text_buffer):
+            self._emit_hex_candidate(match.group(1))
+
+        if "\n" in self.text_buffer:
+            self.text_buffer = self.text_buffer.split("\n")[-1]
+
+    def _emit_hex_candidate(self, hex_payload: str) -> None:
+        clean_payload = hex_payload.strip().upper()
+        now = time.time()
+        last_seen = self.recent_blocks.get(clean_payload, 0.0)
+
+        if len(clean_payload) % 2 != 0:
+            return
+
+        if now - last_seen < 0.8:
+            return
+
+        self.recent_blocks[clean_payload] = now
+        self.recent_blocks = {
+            block: seen_at
+            for block, seen_at in self.recent_blocks.items()
+            if now - seen_at < 10.0
+        }
+
+        self.output_queue.put(("hex_payload", clean_payload))
+
+
+class PinkMonitorApp:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("HackathZee Pembe Monitor")
+        self.root.geometry("1080x720")
+        self.root.minsize(980, 640)
+        self.root.configure(bg="#ffd6e8")
+
+        self.output_queue: queue.Queue = queue.Queue()
+        self.reader: SerialReader | None = None
+        self.sensor_data = SensorData()
+
+        self.port_var = tk.StringVar(value=DEFAULT_PORT)
+        self.baud_var = tk.StringVar(value=str(DEFAULT_BAUDRATE))
+        self.key_var = tk.StringVar(value=DEFAULT_KEY)
+        self.wifi_mode_var = tk.StringVar(value=DEFAULT_WIFI_MODE)
+        self.ap_channel_var = tk.StringVar(value=DEFAULT_AP_CHANNEL)
+        self.ap_encryption_var = tk.StringVar(value=DEFAULT_AP_ENCRYPTION)
+        self.auto_server_var = tk.BooleanVar(value=True)
+        self.status_var = tk.StringVar(value="Hazir")
+        self.last_packet_var = tk.StringVar(value="Bekleniyor")
+
+        self.temperature_var = tk.StringVar(value="-- C")
+        self.humidity_var = tk.StringVar(value="-- %")
+        self.flow_var = tk.StringVar(value="-- L/dk")
+        self.updated_var = tk.StringVar(value="--")
+
+        self._build_style()
+        self._build_layout()
+        self.refresh_ports()
+        self.root.after(150, self.process_queue)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _build_style(self) -> None:
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("TFrame", background="#ffd6e8")
+        style.configure("Card.TFrame", background="#fff1f7")
+        style.configure("TLabel", background="#ffd6e8", foreground="#6d214f", font=("Segoe UI", 10))
+        style.configure("Header.TLabel", background="#ffd6e8", foreground="#8b1e5a", font=("Segoe UI", 20, "bold"))
+        style.configure("Sub.TLabel", background="#ffd6e8", foreground="#94386e", font=("Segoe UI", 10))
+        style.configure("CardTitle.TLabel", background="#fff1f7", foreground="#8b1e5a", font=("Segoe UI", 11, "bold"))
+        style.configure("Value.TLabel", background="#fff1f7", foreground="#5a1237", font=("Segoe UI", 22, "bold"))
+        style.configure("Pink.TButton", background="#ff6fa7", foreground="white", borderwidth=0, focusthickness=0, padding=8)
+        style.map("Pink.TButton", background=[("active", "#ff4f95")])
+        style.configure("TEntry", fieldbackground="#fff8fb", foreground="#5a1237", padding=7)
+        style.configure("TCombobox", fieldbackground="#fff8fb", padding=6)
+
+    def _build_layout(self) -> None:
+        container = ttk.Frame(self.root, padding=18)
+        container.pack(fill="both", expand=True)
+
+        header = ttk.Frame(container)
+        header.pack(fill="x", pady=(0, 12))
+        ttk.Label(header, text="HackathZee Seri Veri Cozucu", style="Header.TLabel").pack(anchor="w")
+        ttk.Label(
+            header,
+            text="STM32 tarafindaki XOR + HEX paketlerini okuyup pembe arayuzde cozer.",
+            style="Sub.TLabel",
+        ).pack(anchor="w", pady=(4, 0))
+
+        controls = ttk.Frame(container, style="Card.TFrame", padding=14)
+        controls.pack(fill="x", pady=(0, 12))
+
+        ttk.Label(controls, text="Port", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
+        self.port_combo = ttk.Combobox(controls, textvariable=self.port_var, state="readonly", width=18)
+        self.port_combo.grid(row=1, column=0, padx=(0, 10), pady=(4, 0), sticky="ew")
+
+        ttk.Label(controls, text="Baud", style="CardTitle.TLabel").grid(row=0, column=1, sticky="w")
+        ttk.Entry(controls, textvariable=self.baud_var, width=12).grid(row=1, column=1, padx=(0, 10), pady=(4, 0), sticky="ew")
+
+        ttk.Label(controls, text="Anahtar", style="CardTitle.TLabel").grid(row=0, column=2, sticky="w")
+        ttk.Entry(controls, textvariable=self.key_var, width=24).grid(row=1, column=2, padx=(0, 10), pady=(4, 0), sticky="ew")
+
+        ttk.Button(controls, text="Portlari Yenile", style="Pink.TButton", command=self.refresh_ports).grid(
+            row=1, column=3, padx=(0, 10), pady=(4, 0), sticky="ew"
+        )
+        ttk.Button(controls, text="Baglan", style="Pink.TButton", command=self.connect).grid(
+            row=1, column=4, padx=(0, 10), pady=(4, 0), sticky="ew"
+        )
+        ttk.Button(controls, text="ESP Sunucu Hazirla", style="Pink.TButton", command=self.start_receiver_server).grid(
+            row=1, column=5, padx=(0, 10), pady=(4, 0), sticky="ew"
+        )
+        ttk.Button(controls, text="Durdur", style="Pink.TButton", command=self.disconnect).grid(
+            row=1, column=6, pady=(4, 0), sticky="ew"
+        )
+        ttk.Label(controls, text="WiFi Mod", style="CardTitle.TLabel").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        ttk.Entry(controls, textvariable=self.wifi_mode_var, width=10).grid(
+            row=3, column=0, padx=(0, 10), pady=(4, 0), sticky="ew"
+        )
+        ttk.Label(controls, text="AP Kanal", style="CardTitle.TLabel").grid(row=2, column=1, sticky="w", pady=(10, 0))
+        ttk.Entry(controls, textvariable=self.ap_channel_var, width=10).grid(
+            row=3, column=1, padx=(0, 10), pady=(4, 0), sticky="ew"
+        )
+        ttk.Label(controls, text="AP Guvenlik", style="CardTitle.TLabel").grid(row=2, column=2, sticky="w", pady=(10, 0))
+        ttk.Entry(controls, textvariable=self.ap_encryption_var, width=10).grid(
+            row=3, column=2, padx=(0, 10), pady=(4, 0), sticky="ew"
+        )
+        ttk.Checkbutton(
+            controls,
+            text="Baglaninca otomatik sunucu kur",
+            variable=self.auto_server_var,
+        ).grid(row=3, column=3, columnspan=3, sticky="w", pady=(4, 0))
+
+        for column in range(7):
+            controls.columnconfigure(column, weight=1)
+
+        status_card = ttk.Frame(container, style="Card.TFrame", padding=12)
+        status_card.pack(fill="x", pady=(0, 12))
+        ttk.Label(status_card, text="Durum", style="CardTitle.TLabel").pack(anchor="w")
+        ttk.Label(status_card, textvariable=self.status_var, style="Value.TLabel").pack(anchor="w", pady=(4, 8))
+        ttk.Label(status_card, text="Son paket saati", style="CardTitle.TLabel").pack(anchor="w")
+        ttk.Label(status_card, textvariable=self.updated_var, style="Sub.TLabel").pack(anchor="w", pady=(4, 0))
+
+        metrics = ttk.Frame(container)
+        metrics.pack(fill="x", pady=(0, 12))
+
+        self._build_metric_card(metrics, "Sicaklik", self.temperature_var, 0)
+        self._build_metric_card(metrics, "Nem", self.humidity_var, 1)
+        self._build_metric_card(metrics, "Debi", self.flow_var, 2)
+
+        metrics.columnconfigure(0, weight=1)
+        metrics.columnconfigure(1, weight=1)
+        metrics.columnconfigure(2, weight=1)
+
+        text_area = ttk.Frame(container)
+        text_area.pack(fill="both", expand=True)
+        text_area.columnconfigure(0, weight=1)
+        text_area.columnconfigure(1, weight=1)
+        text_area.rowconfigure(1, weight=1)
+
+        ttk.Label(text_area, text="Ham Seri Veri", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 6))
+        ttk.Label(text_area, text="Cozulen Paketler", style="CardTitle.TLabel").grid(row=0, column=1, sticky="w", pady=(0, 6))
+
+        self.raw_text = tk.Text(
+            text_area,
+            wrap="word",
+            bg="#fff8fb",
+            fg="#5a1237",
+            insertbackground="#5a1237",
+            relief="flat",
+            font=("Consolas", 10),
+        )
+        self.raw_text.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
+
+        self.decoded_text = tk.Text(
+            text_area,
+            wrap="word",
+            bg="#fff1f7",
+            fg="#6d214f",
+            insertbackground="#6d214f",
+            relief="flat",
+            font=("Consolas", 10),
+        )
+        self.decoded_text.grid(row=1, column=1, sticky="nsew", padx=(8, 0))
+
+        footer = ttk.Frame(container)
+        footer.pack(fill="x", pady=(10, 0))
+        ttk.Label(footer, text="Son yakalanan HEX paket", style="CardTitle.TLabel").pack(anchor="w")
+        ttk.Label(footer, textvariable=self.last_packet_var, style="Sub.TLabel").pack(anchor="w", pady=(4, 0))
+
+    def _build_metric_card(self, parent: ttk.Frame, title: str, variable: tk.StringVar, column: int) -> None:
+        card = ttk.Frame(parent, style="Card.TFrame", padding=16)
+        card.grid(row=0, column=column, sticky="nsew", padx=6)
+        ttk.Label(card, text=title, style="CardTitle.TLabel").pack(anchor="w")
+        ttk.Label(card, textvariable=variable, style="Value.TLabel").pack(anchor="w", pady=(10, 4))
+
+    def refresh_ports(self) -> None:
+        ports = [item.device for item in list_ports.comports()]
+        if not ports:
+            ports = [DEFAULT_PORT]
+
+        self.port_combo["values"] = ports
+        if self.port_var.get() not in ports:
+            self.port_var.set(ports[0])
+        self.status_var.set(f"Port listesi yenilendi: {', '.join(ports)}")
+
+    def connect(self) -> None:
+        if self.reader and self.reader.is_alive():
+            self.status_var.set("Baglanti zaten acik")
+            return
+
+        try:
+            baudrate = int(self.baud_var.get().strip())
+        except ValueError:
+            messagebox.showerror("Hatali Baud", "Baud degeri sayi olmali.")
+            return
+
+        key = self.key_var.get().strip()
+        if not key:
+            messagebox.showerror("Hatali Anahtar", "Anahtar bos birakilamaz.")
+            return
+
+        self.reader = SerialReader(self.port_var.get().strip(), baudrate, self.output_queue)
+        self.reader.start()
+        self.status_var.set(f"Baglanti aciliyor: {self.port_var.get().strip()} @ {baudrate}")
+
+        if self.auto_server_var.get():
+            self.root.after(1200, self.start_receiver_server)
+
+    def disconnect(self) -> None:
+        if self.reader:
+            self.reader.stop()
+            self.reader = None
+        self.status_var.set("Baglanti kapatildi")
+
+    def process_queue(self) -> None:
+        while True:
+            try:
+                item_type, payload = self.output_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if item_type == "raw_text":
+                self._append_text(self.raw_text, payload)
+            elif item_type == "sent_command":
+                self._append_text(self.raw_text, f"\n>> {payload}")
+            elif item_type == "hex_payload":
+                self.handle_hex_payload(payload)
+            elif item_type == "status":
+                self.status_var.set(payload)
+            elif item_type == "error":
+                self.status_var.set(payload)
+                self._append_text(self.decoded_text, f"[HATA] {payload}\n")
+
+        self.root.after(150, self.process_queue)
+
+    def handle_hex_payload(self, hex_payload: str) -> None:
+        self.last_packet_var.set(hex_payload[:120] + ("..." if len(hex_payload) > 120 else ""))
+        key = self.key_var.get().strip()
+
+        try:
+            plaintext = decrypt_hex_payload(hex_payload, key)
+        except Exception as exc:
+            self._append_text(self.decoded_text, f"[COZME HATASI] {hex_payload} -> {exc}\n")
+            return
+
+        self._append_text(
+            self.decoded_text,
+            f"[HEX] {hex_payload}\n[COZULEN] {plaintext.strip()}\n\n",
+        )
+
+        parsed = parse_sensor_payload(plaintext)
+        if parsed is None:
+            self.status_var.set("Paket cozuldu ama sensor formati eslesmedi")
+            return
+
+        parsed.encrypted_hex = hex_payload
+        self.sensor_data = parsed
+        self.temperature_var.set(f"{parsed.temperature_c} C")
+        self.humidity_var.set(f"{parsed.humidity_pct} %")
+        self.flow_var.set(f"{parsed.flow_l_min} L/dk")
+        self.updated_var.set(parsed.updated_at)
+        self.status_var.set("Veri basariyla cozuldu")
+
+    def start_receiver_server(self) -> None:
+        if not self.reader or not self.reader.is_alive():
+            self.status_var.set("Once seri porta baglan")
+            return
+
+        self.status_var.set("ESP-01 alici sunucu ayarlari gonderiliyor")
+        threading.Thread(target=self._configure_receiver_server, daemon=True).start()
+
+    def _configure_receiver_server(self) -> None:
+        wifi_mode = self.wifi_mode_var.get().strip() or DEFAULT_WIFI_MODE
+        ap_channel = self.ap_channel_var.get().strip() or DEFAULT_AP_CHANNEL
+        ap_encryption = self.ap_encryption_var.get().strip() or DEFAULT_AP_ENCRYPTION
+
+        commands = [
+            ("AT", 0.6),
+            ("ATE0", 0.6),
+            (f"AT+CWMODE={wifi_mode}", 1.0),
+            (f'AT+CWSAP="{DEFAULT_AP_SSID}","{DEFAULT_AP_PASSWORD}",{ap_channel},{ap_encryption}', 1.6),
+            ("AT+CIPMUX=1", 0.8),
+            ("AT+CIPSERVER=1,80", 1.0),
+        ]
+
+        for command, wait_seconds in commands:
+            if not self.reader:
+                return
+
+            try:
+                self.reader.send_command(command)
+            except Exception as exc:
+                self.output_queue.put(("error", f"Komut gonderilemedi ({command}): {exc}"))
+                return
+
+            time.sleep(wait_seconds)
+
+        self.output_queue.put(("status", "ESP-01 sunucu hazir: Sera_Agi / port 80"))
+
+    def _append_text(self, widget: tk.Text, value: str) -> None:
+        widget.insert("end", value)
+        widget.see("end")
+
+    def on_close(self) -> None:
+        self.disconnect()
+        self.root.destroy()
+
+
+def main() -> None:
+    root = tk.Tk()
+    app = PinkMonitorApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,10 @@
+00:16:43 **** Incremental Build of configuration Debug for project target_blackpill ****
+make -j12 all 
+arm-none-eabi-size  target_blackpill.elf 
+   text	   data	    bss	    dec	    hex	filename
+  33764	     92	   4756	  38612	   96d4	target_blackpill.elf
+Finished building: default.size.stdout
+ 
+
+00:16:43 Build Finished. 0 errors, 0 warnings. (took 193ms)
+

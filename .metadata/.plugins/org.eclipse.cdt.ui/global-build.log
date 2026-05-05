@@ -1,0 +1,21 @@
+00:16:40 **** Incremental Build of configuration Debug for project target_blackpill ****
+make -j12 all 
+arm-none-eabi-gcc "../Core/Src/main.c" -mcpu=cortex-m4 -std=gnu11 -g3 -DDEBUG -DUSE_HAL_DRIVER -DSTM32F411xE -c -I../Core/Inc -I../Drivers/STM32F4xx_HAL_Driver/Inc -I../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy -I../Drivers/CMSIS/Device/ST/STM32F4xx/Include -I../Drivers/CMSIS/Include -O0 -ffunction-sections -fdata-sections -Wall -fstack-usage -fcyclomatic-complexity -MMD -MP -MF"Core/Src/main.d" -MT"Core/Src/main.o" --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -o "Core/Src/main.o"
+arm-none-eabi-gcc -o "target_blackpill.elf" @"objects.list"   -mcpu=cortex-m4 -T"C:\HackathZee\target_blackpill\STM32F411CEUX_FLASH.ld" --specs=nosys.specs -Wl,-Map="target_blackpill.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+Finished building target: target_blackpill.elf
+ 
+arm-none-eabi-size  target_blackpill.elf 
+arm-none-eabi-objdump -h -S target_blackpill.elf  > "target_blackpill.list"
+   text	   data	    bss	    dec	    hex	filename
+  33764	     92	   4756	  38612	   96d4	target_blackpill.elf
+Finished building: default.size.stdout
+ 
+Finished building: target_blackpill.list
+ 
+00:16:43 **** Incremental Build of configuration Debug for project target_blackpill ****
+make -j12 all 
+arm-none-eabi-size  target_blackpill.elf 
+   text	   data	    bss	    dec	    hex	filename
+  33764	     92	   4756	  38612	   96d4	target_blackpill.elf
+Finished building: default.size.stdout
+ 

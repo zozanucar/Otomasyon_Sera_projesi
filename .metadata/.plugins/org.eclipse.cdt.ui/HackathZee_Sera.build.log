@@ -1,0 +1,10 @@
+00:16:05 **** Incremental Build of configuration Debug for project HackathZee_Sera ****
+make -j12 all 
+arm-none-eabi-size  HackathZee_Sera.elf 
+   text	   data	    bss	    dec	    hex	filename
+  23792	     92	   2804	  26688	   6840	HackathZee_Sera.elf
+Finished building: default.size.stdout
+ 
+
+00:16:05 Build Finished. 0 errors, 0 warnings. (took 260ms)
+

@@ -1,0 +1,902 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdbool.h>
+#include <ctype.h>
+#include <stdio.h>
+#include <string.h>
+
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+typedef struct
+{
+  char temperature_c[12];
+  char humidity_pct[12];
+  char flow_lpm[12];
+  char plaintext[128];
+  char encrypted_hex[193];
+  bool valid;
+  uint32_t updated_at_ms;
+} SensorData_t;
+
+#ifdef HAL_UART_MODULE_ENABLED
+typedef struct
+{
+  const char *command;
+  uint16_t wait_ms;
+  const char *line1;
+  const char *line2;
+} EspCommand_t;
+
+typedef struct
+{
+  uint8_t at_index;
+  uint32_t last_action_ms;
+  bool init_started;
+  bool server_ready;
+  char text_buffer[768];
+  uint16_t text_len;
+  char last_hex[193];
+  uint32_t last_hex_ms;
+  char status_line1[17];
+  char status_line2[17];
+} EspReceiver_t;
+#endif
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+#define USER_LED_GPIO_Port GPIOC
+#define USER_LED_Pin GPIO_PIN_13
+#define LCD_BACKLIGHT              0x08U
+#define LCD_ENABLE_BIT             0x04U
+#define LCD_RS_BIT                 0x01U
+#define LCD_LINE_1_ADDR            0x00U
+#define LCD_LINE_2_ADDR            0x40U
+#define ESP_XOR_KEY                "HackathZee_1283"
+#define ESP_AP_SSID                "Sera_Agi"
+#define ESP_AP_PASSWORD            "12831283"
+#define ESP_WIFI_MODE              "3"
+#define ESP_AP_CHANNEL             "1"
+#define ESP_AP_ENCRYPTION          "3"
+#define ESP_TCP_SERVER_PORT        "80"
+#define ESP_AT_RESPONSE_DELAY_MS   1200U
+#define ESP_BOOT_WAIT_MS           5000U
+#define ESP_DUPLICATE_WINDOW_MS    800U
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+I2C_HandleTypeDef hi2c1;
+
+UART_HandleTypeDef huart1;
+
+/* USER CODE BEGIN PV */
+#ifdef HAL_I2C_MODULE_ENABLED
+extern I2C_HandleTypeDef hi2c1;
+
+static uint16_t lcd_address = 0U;
+static bool lcd_ready = false;
+#endif
+
+static SensorData_t sensor_data = {0};
+
+#ifdef HAL_UART_MODULE_ENABLED
+extern UART_HandleTypeDef huart1;
+
+static EspReceiver_t esp_receiver = {0};
+#endif
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_USART1_UART_Init(void);
+/* USER CODE BEGIN PFP */
+#ifdef HAL_I2C_MODULE_ENABLED
+static void LCD_Init(void);
+static void LCD_ShowMessage(const char *line1, const char *line2);
+static void LCD_Service(void);
+#endif
+
+#ifdef HAL_UART_MODULE_ENABLED
+static void ESP_ServiceStartup(void);
+static void ESP_PollUart(void);
+#endif
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+#ifdef HAL_I2C_MODULE_ENABLED
+static void LCD_ExpanderWrite(uint8_t data)
+{
+  HAL_I2C_Master_Transmit(&hi2c1, lcd_address, &data, 1U, 100U);
+}
+
+static void LCD_PulseEnable(uint8_t data)
+{
+  LCD_ExpanderWrite(data | LCD_ENABLE_BIT);
+  HAL_Delay(1);
+  LCD_ExpanderWrite(data & (uint8_t)~LCD_ENABLE_BIT);
+  HAL_Delay(1);
+}
+
+static void LCD_Write4Bits(uint8_t data)
+{
+  LCD_ExpanderWrite(data | LCD_BACKLIGHT);
+  LCD_PulseEnable(data | LCD_BACKLIGHT);
+}
+
+static void LCD_Send(uint8_t value, uint8_t mode)
+{
+  uint8_t high_nibble = value & 0xF0U;
+  uint8_t low_nibble = (uint8_t)((value << 4U) & 0xF0U);
+
+  LCD_Write4Bits(high_nibble | mode);
+  LCD_Write4Bits(low_nibble | mode);
+}
+
+static void LCD_SendCommand(uint8_t command)
+{
+  LCD_Send(command, 0U);
+
+  if ((command == 0x01U) || (command == 0x02U))
+  {
+    HAL_Delay(2);
+  }
+  else
+  {
+    HAL_Delay(1);
+  }
+}
+
+static void LCD_SendData(uint8_t data)
+{
+  LCD_Send(data, LCD_RS_BIT);
+  HAL_Delay(1);
+}
+
+static void LCD_SetCursor(uint8_t row, uint8_t col)
+{
+  uint8_t base_addr = (row == 0U) ? LCD_LINE_1_ADDR : LCD_LINE_2_ADDR;
+  LCD_SendCommand((uint8_t)(0x80U | (base_addr + col)));
+}
+
+static void LCD_PrintLine(uint8_t row, const char *text)
+{
+  char buffer[17];
+  size_t text_len = strlen(text);
+
+  memset(buffer, ' ', 16U);
+  buffer[16] = '\0';
+
+  if (text_len > 16U)
+  {
+    text_len = 16U;
+  }
+
+  memcpy(buffer, text, text_len);
+
+  LCD_SetCursor(row, 0U);
+  for (uint8_t i = 0U; i < 16U; i++)
+  {
+    LCD_SendData((uint8_t)buffer[i]);
+  }
+}
+
+static void LCD_ShowMessage(const char *line1, const char *line2)
+{
+  if (!lcd_ready)
+  {
+    return;
+  }
+
+  LCD_PrintLine(0U, line1);
+  LCD_PrintLine(1U, line2);
+}
+
+static uint16_t LCD_FindAddress(void)
+{
+  for (uint16_t address = 0x08U; address <= 0x77U; address++)
+  {
+    if (HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(address << 1U), 2U, 100U) == HAL_OK)
+    {
+      return (uint16_t)(address << 1U);
+    }
+  }
+
+  return 0U;
+}
+
+static void LCD_Init(void)
+{
+  lcd_address = LCD_FindAddress();
+  if (lcd_address == 0U)
+  {
+    lcd_ready = false;
+    return;
+  }
+
+  lcd_ready = true;
+
+  HAL_Delay(50);
+  LCD_Write4Bits(0x30U);
+  HAL_Delay(5);
+  LCD_Write4Bits(0x30U);
+  HAL_Delay(5);
+  LCD_Write4Bits(0x30U);
+  HAL_Delay(1);
+  LCD_Write4Bits(0x20U);
+
+  LCD_SendCommand(0x28U);
+  LCD_SendCommand(0x0CU);
+  LCD_SendCommand(0x06U);
+  LCD_SendCommand(0x01U);
+  LCD_ShowMessage("LCD Baglandi", "ESP Bekleniyor");
+}
+
+static void LCD_Service(void)
+{
+  static uint32_t last_update_ms = 0U;
+  static bool show_flow_page = false;
+  char line1[17];
+  char line2[17];
+
+  if (!lcd_ready)
+  {
+    return;
+  }
+
+  if ((HAL_GetTick() - last_update_ms) < 1000U)
+  {
+    return;
+  }
+
+  last_update_ms = HAL_GetTick();
+
+  if (!sensor_data.valid)
+  {
+    #ifdef HAL_UART_MODULE_ENABLED
+    LCD_ShowMessage(esp_receiver.status_line1, esp_receiver.status_line2);
+    #else
+    LCD_ShowMessage("Veri Yok", "UART Kapali");
+    #endif
+    return;
+  }
+
+  if (show_flow_page)
+  {
+    snprintf(line1, sizeof(line1), "DEBI:%s", sensor_data.flow_lpm);
+    snprintf(line2, sizeof(line2), "L/dk");
+  }
+  else
+  {
+    snprintf(line1, sizeof(line1), "SIC:%sC", sensor_data.temperature_c);
+    snprintf(line2, sizeof(line2), "NEM:%s%%", sensor_data.humidity_pct);
+  }
+
+  show_flow_page = !show_flow_page;
+
+  LCD_ShowMessage(line1, line2);
+}
+#endif
+
+#ifdef HAL_UART_MODULE_ENABLED
+static const EspCommand_t esp_init_commands[] =
+{
+  {"AT", ESP_BOOT_WAIT_MS, "ESP Uyaniyor", "AT Gonderildi"},
+  {"ATE0", ESP_AT_RESPONSE_DELAY_MS, "Echo Kapat", "ATE0"},
+  {"AT+CWMODE=" ESP_WIFI_MODE, ESP_AT_RESPONSE_DELAY_MS, "WiFi Mod", "CWMODE=3"},
+  {"AT+CWSAP=\"" ESP_AP_SSID "\",\"" ESP_AP_PASSWORD "\"," ESP_AP_CHANNEL "," ESP_AP_ENCRYPTION, 1600U, "AP Kuruluyor", ESP_AP_SSID},
+  {"AT+CIPMUX=1", ESP_AT_RESPONSE_DELAY_MS, "ESP Sunucu", "CIPMUX=1"},
+  {"AT+CIPSERVER=1," ESP_TCP_SERVER_PORT, 1000U, "ESP Sunucu", "CIPSERVER=1"}
+};
+
+static void ESP_SetStatus(const char *line1, const char *line2)
+{
+  snprintf(esp_receiver.status_line1, sizeof(esp_receiver.status_line1), "%s", line1);
+  snprintf(esp_receiver.status_line2, sizeof(esp_receiver.status_line2), "%s", line2);
+}
+
+static void ESP_SendCommand(const char *command)
+{
+  static const char line_end[] = "\r\n";
+
+  HAL_UART_Transmit(&huart1, (uint8_t *)command, (uint16_t)strlen(command), 1000U);
+  HAL_UART_Transmit(&huart1, (uint8_t *)line_end, 2U, 100U);
+}
+
+static uint8_t ESP_HexNibble(char value)
+{
+  if ((value >= '0') && (value <= '9'))
+  {
+    return (uint8_t)(value - '0');
+  }
+
+  value = (char)toupper((unsigned char)value);
+  return (uint8_t)(10 + (value - 'A'));
+}
+
+static bool ESP_DecryptHexPayload(const char *hex_payload, char *plaintext, size_t plaintext_size)
+{
+  size_t hex_len = strlen(hex_payload);
+  const char *key = ESP_XOR_KEY;
+  size_t key_len = strlen(key);
+  size_t out_index = 0U;
+
+  if ((hex_len == 0U) || ((hex_len % 2U) != 0U) || (key_len == 0U))
+  {
+    return false;
+  }
+
+  for (size_t i = 0U; i < hex_len; i += 2U)
+  {
+    uint8_t encrypted_byte;
+
+    if ((out_index + 1U) >= plaintext_size)
+    {
+      return false;
+    }
+
+    encrypted_byte = (uint8_t)((ESP_HexNibble(hex_payload[i]) << 4U) | ESP_HexNibble(hex_payload[i + 1U]));
+    plaintext[out_index] = (char)(encrypted_byte ^ (uint8_t)key[out_index % key_len]);
+    out_index++;
+  }
+
+  plaintext[out_index] = '\0';
+  return true;
+}
+
+static const char *ESP_FindLabelInsensitive(const char *text, const char *label)
+{
+  size_t label_len = strlen(label);
+
+  if (label_len == 0U)
+  {
+    return NULL;
+  }
+
+  for (const char *cursor = text; *cursor != '\0'; cursor++)
+  {
+    size_t index = 0U;
+
+    while ((index < label_len) &&
+           (tolower((unsigned char)cursor[index]) == tolower((unsigned char)label[index])))
+    {
+      index++;
+    }
+
+    if (index == label_len)
+    {
+      return cursor;
+    }
+  }
+
+  return NULL;
+}
+
+static bool ESP_CopyField(const char *payload, const char *label, char terminator, char *out, size_t out_size)
+{
+  const char *start = ESP_FindLabelInsensitive(payload, label);
+  size_t index = 0U;
+
+  if ((start == NULL) || (out_size == 0U))
+  {
+    return false;
+  }
+
+  start += strlen(label);
+  while (*start == ' ')
+  {
+    start++;
+  }
+
+  while ((*start != '\0') && (*start != terminator) && (index + 1U < out_size))
+  {
+    out[index++] = *start++;
+  }
+
+  while ((index > 0U) && (out[index - 1U] == ' '))
+  {
+    index--;
+  }
+
+  out[index] = '\0';
+  return index > 0U;
+}
+
+static bool ESP_ParseSensorPayload(const char *payload, SensorData_t *parsed)
+{
+  if (!ESP_CopyField(payload, "Sicaklik:", 'C', parsed->temperature_c, sizeof(parsed->temperature_c)))
+  {
+    return false;
+  }
+
+  if (!ESP_CopyField(payload, "Nem:", '%', parsed->humidity_pct, sizeof(parsed->humidity_pct)))
+  {
+    return false;
+  }
+
+  if (!ESP_CopyField(payload, "Debi:", 'L', parsed->flow_lpm, sizeof(parsed->flow_lpm)))
+  {
+    return false;
+  }
+
+  snprintf(parsed->plaintext, sizeof(parsed->plaintext), "%s", payload);
+  parsed->updated_at_ms = HAL_GetTick();
+  parsed->valid = true;
+  return true;
+}
+
+static void ESP_HandleHexCandidate(const char *hex_payload)
+{
+  SensorData_t parsed = {0};
+  char plaintext[128];
+  uint32_t now = HAL_GetTick();
+
+  if ((strlen(hex_payload) < 16U) || ((strlen(hex_payload) % 2U) != 0U))
+  {
+    return;
+  }
+
+  if ((strcmp(hex_payload, esp_receiver.last_hex) == 0) &&
+      ((now - esp_receiver.last_hex_ms) < ESP_DUPLICATE_WINDOW_MS))
+  {
+    return;
+  }
+
+  snprintf(esp_receiver.last_hex, sizeof(esp_receiver.last_hex), "%s", hex_payload);
+  esp_receiver.last_hex_ms = now;
+
+  if (!ESP_DecryptHexPayload(hex_payload, plaintext, sizeof(plaintext)))
+  {
+    ESP_SetStatus("Cozme Hatasi", "HEX Gecersiz");
+    return;
+  }
+
+  if (!ESP_ParseSensorPayload(plaintext, &parsed))
+  {
+    ESP_SetStatus("Paket Geldi", "Format Uyusmadi");
+    return;
+  }
+
+  snprintf(parsed.encrypted_hex, sizeof(parsed.encrypted_hex), "%s", hex_payload);
+  sensor_data = parsed;
+  ESP_SetStatus("Veri Cozuldu", "LCD Guncel");
+}
+
+static void ESP_HandleHexRange(const char *start, size_t length)
+{
+  char hex_payload[193];
+
+  if ((length < 16U) || (length >= sizeof(hex_payload)) || ((length % 2U) != 0U))
+  {
+    return;
+  }
+
+  memcpy(hex_payload, start, length);
+  hex_payload[length] = '\0';
+  ESP_HandleHexCandidate(hex_payload);
+}
+
+static void ESP_ProcessTextBuffer(void)
+{
+  uint16_t i = 0U;
+
+  while (i < esp_receiver.text_len)
+  {
+    if ((i + 5U) <= esp_receiver.text_len &&
+        memcmp(&esp_receiver.text_buffer[i], "+IPD,", 5U) == 0)
+    {
+      uint16_t cursor = i + 5U;
+
+      while ((cursor < esp_receiver.text_len) &&
+             (esp_receiver.text_buffer[cursor] != ':'))
+      {
+        cursor++;
+      }
+
+      if (cursor < esp_receiver.text_len)
+      {
+        uint16_t hex_start = (uint16_t)(cursor + 1U);
+        uint16_t hex_end = hex_start;
+
+        while ((hex_end < esp_receiver.text_len) &&
+               (isxdigit((unsigned char)esp_receiver.text_buffer[hex_end]) != 0))
+        {
+          esp_receiver.text_buffer[hex_end] =
+              (char)toupper((unsigned char)esp_receiver.text_buffer[hex_end]);
+          hex_end++;
+        }
+
+        ESP_HandleHexRange(&esp_receiver.text_buffer[hex_start], (size_t)(hex_end - hex_start));
+        i = hex_end;
+        continue;
+      }
+    }
+
+    if (isxdigit((unsigned char)esp_receiver.text_buffer[i]) != 0)
+    {
+      uint16_t hex_start = i;
+      uint16_t hex_end = i;
+
+      while ((hex_end < esp_receiver.text_len) &&
+             (isxdigit((unsigned char)esp_receiver.text_buffer[hex_end]) != 0))
+      {
+        esp_receiver.text_buffer[hex_end] =
+            (char)toupper((unsigned char)esp_receiver.text_buffer[hex_end]);
+        hex_end++;
+      }
+
+      ESP_HandleHexRange(&esp_receiver.text_buffer[hex_start], (size_t)(hex_end - hex_start));
+      i = hex_end;
+      continue;
+    }
+
+    i++;
+  }
+
+  if (esp_receiver.text_len > 384U)
+  {
+    memmove(esp_receiver.text_buffer,
+            &esp_receiver.text_buffer[esp_receiver.text_len - 192U],
+            192U);
+    esp_receiver.text_len = 192U;
+    esp_receiver.text_buffer[esp_receiver.text_len] = '\0';
+  }
+}
+
+static void ESP_PollUart(void)
+{
+  uint8_t byte = 0U;
+  uint8_t read_count = 0U;
+
+  while (read_count < 64U)
+  {
+    if (HAL_UART_Receive(&huart1, &byte, 1U, 0U) != HAL_OK)
+    {
+      break;
+    }
+
+    if (esp_receiver.text_len < (sizeof(esp_receiver.text_buffer) - 1U))
+    {
+      esp_receiver.text_buffer[esp_receiver.text_len++] = (char)byte;
+      esp_receiver.text_buffer[esp_receiver.text_len] = '\0';
+    }
+    else
+    {
+      memmove(esp_receiver.text_buffer,
+              &esp_receiver.text_buffer[esp_receiver.text_len - 256U],
+              256U);
+      esp_receiver.text_len = 256U;
+      esp_receiver.text_buffer[esp_receiver.text_len++] = (char)byte;
+      esp_receiver.text_buffer[esp_receiver.text_len] = '\0';
+    }
+
+    read_count++;
+  }
+
+  if (read_count > 0U)
+  {
+    ESP_ProcessTextBuffer();
+  }
+}
+
+static void ESP_ServiceStartup(void)
+{
+  uint32_t now = HAL_GetTick();
+
+  if (!esp_receiver.init_started)
+  {
+    esp_receiver.init_started = true;
+    esp_receiver.last_action_ms = 0U;
+    ESP_SetStatus("ESP Basliyor", "Boot Bekleniyor");
+  }
+
+  if (esp_receiver.server_ready)
+  {
+    return;
+  }
+
+  if (esp_receiver.at_index >= (sizeof(esp_init_commands) / sizeof(esp_init_commands[0])))
+  {
+    esp_receiver.server_ready = true;
+    ESP_SetStatus("ESP Sunucu Hazir", "Veri Bekleniyor");
+    return;
+  }
+
+  if ((now - esp_receiver.last_action_ms) < esp_init_commands[esp_receiver.at_index].wait_ms)
+  {
+    return;
+  }
+
+  ESP_SendCommand(esp_init_commands[esp_receiver.at_index].command);
+  ESP_SetStatus(esp_init_commands[esp_receiver.at_index].line1, esp_init_commands[esp_receiver.at_index].line2);
+  esp_receiver.last_action_ms = now;
+  esp_receiver.at_index++;
+}
+#endif
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_I2C1_Init();
+  MX_USART1_UART_Init();
+  /* USER CODE BEGIN 2 */
+  HAL_GPIO_WritePin(USER_LED_GPIO_Port, USER_LED_Pin, GPIO_PIN_SET);
+#ifdef HAL_I2C_MODULE_ENABLED
+  LCD_Init();
+  LCD_Service();
+#endif
+#ifdef HAL_UART_MODULE_ENABLED
+  ESP_SetStatus("ESP Basliyor", "Boot Bekleniyor");
+#endif
+
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+    static uint32_t last_led_toggle_ms = 0U;
+
+    if ((HAL_GetTick() - last_led_toggle_ms) >= 500U)
+    {
+      last_led_toggle_ms = HAL_GetTick();
+      HAL_GPIO_TogglePin(USER_LED_GPIO_Port, USER_LED_Pin);
+    }
+
+#ifdef HAL_UART_MODULE_ENABLED
+    ESP_ServiceStartup();
+    ESP_PollUart();
+#endif
+
+#ifdef HAL_I2C_MODULE_ENABLED
+    LCD_Service();
+#endif
+
+    HAL_Delay(10);
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = 8;
+  RCC_OscInitStruct.PLL.PLLN = 64;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 4;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV4;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.ClockSpeed = 100000;
+  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+  HAL_GPIO_WritePin(USER_LED_GPIO_Port, USER_LED_Pin, GPIO_PIN_SET);
+
+  GPIO_InitStruct.Pin = USER_LED_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(USER_LED_GPIO_Port, &GPIO_InitStruct);
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+
+#ifdef  USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */

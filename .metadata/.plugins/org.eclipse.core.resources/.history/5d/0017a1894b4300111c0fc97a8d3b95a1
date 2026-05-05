@@ -1,0 +1,52 @@
+# Secure Telemetry Protocol
+
+Verici tarafi `AES-128-CTR + HMAC-SHA256` kullanir.
+
+## Ortak Sir
+
+Iki taraf da ayni `master secret` degerini bilmelidir.
+
+Mevcut projede bu deger:
+
+`HackathZee_1283`
+
+## Anahtar Turetme
+
+AES anahtari:
+
+`aes_key = SHA256("AES-128-CTR" || master_secret)[0..15]`
+
+HMAC anahtari:
+
+`hmac_key = SHA256("HMAC-SHA256" || master_secret)[0..31]`
+
+## Paket Formati
+
+ASCII olarak gonderilir:
+
+`ST1:LLLL:IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII:CCCC...:TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT`
+
+Alanlar:
+
+- `ST1`: protokol surumu
+- `LLLL`: plaintext uzunlugu, 4 hex karakter
+- `I...`: 16 byte IV, 32 hex karakter
+- `C...`: ciphertext, `plaintext_len * 2` hex karakter
+- `T...`: HMAC-SHA256 sonucunun ilk 16 byte'i, 32 hex karakter
+
+## Bluepill Tarafinda Dogrulama
+
+1. Paketi `:` ile parcala.
+2. `ST1` basligini kontrol et.
+3. `LLLL` alanini hex'ten uzunluga cevir.
+4. `IV`, `ciphertext` ve `tag` alanlarini hex'ten byte dizisine cevir.
+5. `expected_tag = HMAC_SHA256(hmac_key, IV || ciphertext)[0..15]` hesapla.
+6. `expected_tag` ile gelen `tag` ayni degilse paketi reddet.
+7. `plaintext = AES-128-CTR(ciphertext, aes_key, IV)` ile cozumle.
+8. Plaintext'i string sonlandirip LCD'de goster.
+
+## Notlar
+
+- CTR modunda sifreleme ve cozumleme ayni islemdir.
+- HMAC dogrulamasi basarisizsa veri LCD'ye yazdirilmamalidir.
+- Mevcut verici tarafta IV her mesajda yeniden uretilir ve paketin icinde gonderilir.
